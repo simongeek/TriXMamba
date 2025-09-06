@@ -9,6 +9,21 @@ import torch.nn.functional as F
 import einops
 
 
+class DynamicTanh(nn.Module):
+    def __init__(self, normalized_shape, alpha_init_value=0.5):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.alpha_init_value = alpha_init_value
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+
+    def forward(self, x):
+        return self.weight * torch.tanh(self.alpha * x) + self.bias
+
+    def extra_repr(self):
+        return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}"
+
 class DoubleConv2d(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -152,89 +167,91 @@ class LayerNorm(nn.Module):
 
 class TripletMixerMambaLayer(nn.Module):
     def __init__(self, dim, d_state=16, d_conv=4, expand=2):
-        """
-        Args:
-            dim: Model dimension.
-            d_state: State-space size for the SSM.
-            d_conv: Convolution width.
-            expand: Expansion factor for the intermediate dimension.
-        """
         super().__init__()
         self.dim = dim
-        self.norm = nn.LayerNorm(dim)
+        self.norm = DynamicTanh(dim)
 
-        # SSM and convolutions
-        self.mamba = Mamba(
-            d_model=dim,  # State-space model
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
-        self.conv1d_1 = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=3,
-            groups=dim,
-            padding="same",
-        )
-        self.conv1d_2 = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=5,
-            groups=dim,
-            padding="same",
-        )
-        self.conv1d_3 = nn.Conv1d(
-            in_channels=dim,
-            out_channels=dim,
-            kernel_size=7,
-            groups=dim,
-            padding="same"
+        # Experts
+        self.mamba = Mamba(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+
+        self.conv_kernels = [3, 5, 7]
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(dim, dim, kernel_size=k, padding=k // 2, groups=dim),
+                nn.Conv1d(dim, dim, kernel_size=1),
+            )
+            for k in self.conv_kernels
+        ])
+
+        # Hierarchical gating
+        self.group_gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, 2)  # 2 groups: Conv group, Mamba group
         )
 
-        # Output projections
+        self.conv_gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, 3)  # 3 conv experts
+        )
+
+        self.mamba_gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, 1)  # Single mamba expert
+        )
+
         self.linear_out = nn.Linear(dim, dim)
         self.linear_skip = nn.Linear(dim, dim)
 
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor of shape (batch_size, channels, spatial_dims...).
+        # For bidirectional communication
+        self.conv_to_mamba = nn.Linear(dim, dim)
+        self.mamba_to_conv = nn.Linear(dim, dim)
 
-        Returns:
-            Output tensor of the same shape as the input.
-        """
+    def forward(self, x):
         B, C = x.shape[:2]
         x_skip = x
-        assert C == self.dim
-
-        # Flatten spatial dimensions
-        n_tokens = x.shape[2:].numel()
         img_dims = x.shape[2:]
-        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
+        N = x[0, 0].numel()
 
-        # Normalization
+        x_flat = x.reshape(B, C, N).transpose(-1, -2)  # (B, N, C)
         x_norm = self.norm(x_flat)
 
-        # SSM path
-        x_ssm = self.mamba(x_norm)
+        # Experts
+        x_mamba = self.mamba(x_norm)  # (B, N, C)
+        x_convs = [F.silu(conv(x_norm.transpose(-1, -2))).transpose(-1, -2) for conv in self.convs]
+        x_conv_stack = torch.stack(x_convs, dim=2)  # (B, N, 3, C)
 
-        # Conv1D paths
-        x_conv1 = F.silu(self.conv1d_1(x_norm.transpose(-1, -2))).transpose(-1, -2)
-        x_conv2 = F.silu(self.conv1d_2(x_norm.transpose(-1, -2))).transpose(-1, -2)
-        x_conv3 = F.silu(self.conv1d_3(x_norm.transpose(-1, -2))).transpose(-1, -2)
-        # Combine all paths
-        x_combined = x_ssm + x_conv1 + x_conv2 + x_conv3
+        # Hierarchical gating
+        g1_logits = self.group_gate(x_norm)  # (B, N, 2)
+        g1_weights = F.softmax(g1_logits, dim=-1)  # (B, N, 2)
 
-        # Final projections
-        out = self.linear_out(x_combined) + self.linear_skip(x_norm)
+        g_conv_logits = self.conv_gate(x_norm)  # (B, N, 3)
+        g_conv_weights = F.softmax(g_conv_logits, dim=-1)  # (B, N, 3)
 
-        # Reshape back to original dimensions
+        g_mamba_weight = torch.sigmoid(self.mamba_gate(x_norm))  # (B, N, 1)
+
+        # Weighted sums of experts
+        x_conv_mixed = torch.sum(x_conv_stack * g_conv_weights.unsqueeze(-1), dim=2)  # (B, N, C)
+        x_mamba_weighted = x_mamba * g_mamba_weight  # (B, N, C)
+
+        # Bidirectional communication: experts influence each other
+        mamba_from_conv = self.conv_to_mamba(x_conv_mixed)
+        conv_from_mamba = self.mamba_to_conv(x_mamba_weighted)
+
+        x_mamba_updated = x_mamba_weighted + mamba_from_conv
+        x_conv_updated = x_conv_mixed + conv_from_mamba
+
+        # Final weighted combination
+        x_final = (
+            g1_weights[:, :, 0:1] * x_conv_updated +
+            g1_weights[:, :, 1:2] * x_mamba_updated
+        )  # (B, N, C)
+
+        out = self.linear_out(x_final) + self.linear_skip(x_norm)
         out = out.transpose(-1, -2).reshape(B, C, *img_dims)
-
-        # Residual connection
-        out = out + x_skip
-        return out
+        return out + x_skip
 
 
 class MlpChannel(nn.Module):
@@ -320,8 +337,7 @@ class MambaEncoder(nn.Module):
             gsc = GSC(dims[i])
 
             stage = nn.Sequential(
-                *[TripletMixerMambaLayer(dim=dims[i])]
-            )
+                *[TripletMixerMambaLayer(dim=dims[i]) for _ in range(depths[i])])
 
             self.stages.append(stage)
             self.gscs.append(gsc)
